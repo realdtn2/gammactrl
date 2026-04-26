@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=gammactrl
+GenericName=Gamma Control
+Comment=Adjust display gamma on KDE Plasma Wayland
+Exec=gammactrl %f
+Icon=org.gammactrl
+Terminal=false
+Type=Application
+Categories=Settings;HardwareSettings;
+Keywords=gamma;display;color;calibration;brightness;monitor;
+MimeType=application/vnd.iccprofile;
