@@ -4,6 +4,8 @@ A graphical utility to adjust display gamma on KDE Plasma Wayland sessions.
 
 Wayland does not natively support legacy X11 gamma adjustment tools like `xgamma`. This tool works around that limitation by copying your active ICC color profile (or generating a neutral one), patching the VCGT (Video Card Gamma Table) tag with your desired gamma multiplier, and applying it seamlessly using `kscreen-doctor`.
 
+Note: HDR is not supported yet.
+
 ## Prerequisites
 
 To build and run this application, you will need the following packages installed on your system. The exact package names may vary slightly depending on your Linux distribution.
