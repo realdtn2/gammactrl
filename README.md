@@ -48,4 +48,4 @@ After installation, launch `gammactrl` in your terminal or search for "Gamma Con
 
 Use the slider to dynamically brighten or darken your display.
 
-The application starts immediately with a default baseline of `1.485`. This should be fine unless the baseline does not align with your actual screen default gamma. To set a custom baseline for a monitor, use the **Resync Baseline** button.
+The application uses a default baseline. This should be fine unless the baseline does not align with your actual screen default gamma. To set a custom baseline for a monitor, use the **Resync Baseline** button.
