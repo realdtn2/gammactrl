@@ -1,16 +1,3 @@
-/*
- * gammactrl — gamma control for KDE Plasma Wayland
- * - Copies original ICC, patches only VCGT tag
- * - Fixed output detection, sync on first run
- * - Day 1 Persistence: Remembers original profile forever
- * - Added Reset All Settings & Relaunch functionality
- * - Added Change Day 1 Default functionality with forced Resync
- * - Per-Monitor Persistence: Independent baselines, multipliers, and ICCs
- * - Sync Cancel Fix: Seamlessly reverts to prior state on cancel
- * - Dropdown click rescans monitors before opening
- * - Build: cmake -B build && cmake --build build
- */
-
 #include <gtk/gtk.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,77 +14,60 @@
 #define CONFIG_DIR     "/.config/gammactrl"
 #define N_ENTRIES      256
 #define MAX_OUTPUTS    16
-#define GAMMA_MIN      -1.0
-#define GAMMA_MAX       3.0
-#define GAMMA_STEP      0.00001
-#define SLIDER_DEFAULT  1.0
+#define GAMMA_MIN      0.001
+#define GAMMA_MAX      3.0
+#define GAMMA_STEP     0.00001
+#define SLIDER_DEFAULT 1.0
+#define NATIVE_GAMMA   1.48495
 
-/* ── Logging macro ──────────────────────────────────────────────────────── */
 #define LOG(fmt, ...) fprintf(stderr, "[gammactrl] " fmt "\n", ##__VA_ARGS__)
 
 /* ── Per-Monitor Persistence ────────────────────────────────────────────── */
+
+static double load_double_config(const char *filename, double def, double lo, double hi) {
+    FILE *f = fopen(filename, "r");
+    if (!f) return def;
+    double v = def;
+    fscanf(f, "%lf", &v);
+    fclose(f);
+    return (v >= lo && v <= hi) ? v : def;
+}
+
+static void save_double_config(const char *filename, double val) {
+    const char *home = g_get_home_dir();
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s" CONFIG_DIR, home);
+    mkdir(dir, 0755);
+    FILE *f = fopen(filename, "w");
+    if (f) { fprintf(f, "%.5f\n", val); fclose(f); }
+}
 
 static double load_multiplier(const char *out_name) {
     const char *home = g_get_home_dir();
     char path[512];
     snprintf(path, sizeof(path), "%s/.config/gammactrl/mult_%s", home, out_name);
-    FILE *f = fopen(path, "r");
-    if (!f) return SLIDER_DEFAULT;
-    double v = SLIDER_DEFAULT;
-    fscanf(f, "%lf", &v);
-    fclose(f);
-    if (v < GAMMA_MIN || v > GAMMA_MAX) return SLIDER_DEFAULT;
-    return v;
+    return load_double_config(path, SLIDER_DEFAULT, GAMMA_MIN, GAMMA_MAX);
 }
 
 static void save_multiplier(const char *out_name, double val) {
     const char *home = g_get_home_dir();
-    char dir[512], path[512];
-    snprintf(dir,  sizeof(dir),  "%s" CONFIG_DIR,  home);
+    char path[512];
     snprintf(path, sizeof(path), "%s/.config/gammactrl/mult_%s", home, out_name);
-    mkdir(dir, 0755);
-    FILE *f = fopen(path, "w");
-    if (f) {
-        fprintf(f, "%.5f\n", val);
-        fclose(f);
-    }
+    save_double_config(path, val);
 }
 
-static double load_base_gamma(const char *out_name) {
+static double load_sync_baseline(const char *out_name) {
     const char *home = g_get_home_dir();
     char path[512];
-    snprintf(path, sizeof(path), "%s/.config/gammactrl/base_%s", home, out_name);
-    LOG("Loading baseline from %s", path);
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        LOG("No baseline file found for %s (first run).", out_name);
-        return -1.0;
-    }
-    double v = -1.0;
-    fscanf(f, "%lf", &v);
-    fclose(f);
-    if (v < 0.50 || v > 3.00) {
-        LOG("Invalid baseline value %.2f, ignoring.", v);
-        return -1.0;
-    }
-    LOG("Loaded baseline gamma = %.5f", v);
-    return v;
+    snprintf(path, sizeof(path), "%s/.config/gammactrl/sync_%s", home, out_name);
+    return load_double_config(path, 1.0, 0.1, 5.0);
 }
 
-static void save_base_gamma(const char *out_name, double gamma) {
+static void save_sync_baseline(const char *out_name, double val) {
     const char *home = g_get_home_dir();
-    char dir[512], path[512];
-    snprintf(dir,  sizeof(dir),  "%s" CONFIG_DIR,  home);
-    snprintf(path, sizeof(path), "%s/.config/gammactrl/base_%s", home, out_name);
-    mkdir(dir, 0755);
-    FILE *f = fopen(path, "w");
-    if (!f) {
-        LOG("ERROR: Cannot save baseline to %s", path);
-        return;
-    }
-    fprintf(f, "%.5f\n", gamma);
-    fclose(f);
-    LOG("Saved baseline gamma = %.5f to %s", gamma, path);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/.config/gammactrl/sync_%s", home, out_name);
+    save_double_config(path, val);
 }
 
 /* ── Utilities ──────────────────────────────────────────────────────────── */
@@ -113,7 +83,6 @@ static void write_bes32(uint8_t *p, int32_t v) { write_be32(p, (uint32_t)v); }
 typedef struct {
     char name[256];
     char icc[512];
-    int  priority;
     int  icc_toggle;  /* alternates 0/1 per apply; -1 = uninitialized */
 } Output;
 
@@ -131,25 +100,21 @@ static void manage_day1_profile(int cur) {
         if (fgets(stored, sizeof(stored), f)) {
             char *nl = strchr(stored, '\n');
             if (nl) *nl = '\0';
-
-            if (strcmp(stored, "[NONE]") == 0) {
+            if (strcmp(stored, "[NONE]") == 0)
                 g_outputs[cur].icc[0] = '\0';
-            } else {
+            else
                 strncpy(g_outputs[cur].icc, stored, sizeof(g_outputs[cur].icc)-1);
-            }
             LOG("Output %d loaded persistent Day 1 profile: %s", cur, stored);
         }
         fclose(f);
     } else {
-        if (strstr(g_outputs[cur].icc, "gammactrl_") ) {
+        if (strstr(g_outputs[cur].icc, "gammactrl_")) {
             LOG("WARNING: Active profile is a temporary gammactrl file. Defaulting Day 1 to [NONE].");
             g_outputs[cur].icc[0] = '\0';
         }
-
         char dir[512];
         snprintf(dir, sizeof(dir), "%s" CONFIG_DIR, home);
         mkdir(dir, 0755);
-
         f = fopen(path, "w");
         if (f) {
             fprintf(f, "%s\n", g_outputs[cur].icc[0] ? g_outputs[cur].icc : "[NONE]");
@@ -168,6 +133,7 @@ static int detect_outputs(void) {
     char line[1024];
     int cur = -1;
     while (fgets(line, sizeof(line), f)) {
+        /* Strip ANSI escape codes in-place */
         char *src = line, *dst = line;
         while (*src) {
             if (*src == '\033') {
@@ -190,16 +156,12 @@ static int detect_outputs(void) {
         if (output_pos) {
             char *p = output_pos + 7;
             while (*p == ' ') p++;
-
-            int id = 1;
             char name[256] = {0};
-
-            if (sscanf(p, "%d %255s", &id, name) == 2 || sscanf(p, "%255s", name) == 1) {
+            if (sscanf(p, "%*d %255s", name) == 1 || sscanf(p, "%255s", name) == 1) {
                 if (g_n_outputs < MAX_OUTPUTS) {
                     cur = g_n_outputs++;
                     strncpy(g_outputs[cur].name, name, sizeof(g_outputs[cur].name)-1);
-                    g_outputs[cur].icc[0] = '\0';
-                    g_outputs[cur].priority = id;
+                    g_outputs[cur].icc[0]    = '\0';
                     g_outputs[cur].icc_toggle = -1;
                 }
             }
@@ -213,22 +175,16 @@ static int detect_outputs(void) {
                 char *end = val + strlen(val) - 1;
                 while (end > val && (*end == ' ' || *end == '\t' || *end == '\r')) end--;
                 *(end+1) = '\0';
-
-                if (strcmp(val, "none") != 0 && strlen(val) > 0) {
+                if (strcmp(val, "none") != 0 && strlen(val) > 0)
                     strncpy(g_outputs[cur].icc, val, sizeof(g_outputs[cur].icc)-1);
-                }
             }
         }
     }
     pclose(f);
 
-    for (int i = 0; i < g_n_outputs; i++) {
+    for (int i = 0; i < g_n_outputs; i++)
         manage_day1_profile(i);
-    }
 
-    /* Ensure ICC dir exists, then delete stale toggle files from previous
-     * session. KWin ignores reapplication of the same path string even if
-     * file contents changed — deleting forces a genuinely new path. */
     {
         const char *home = g_get_home_dir();
         char icc_dir[512];
@@ -236,10 +192,8 @@ static int detect_outputs(void) {
         mkdir(icc_dir, 0755);
         for (int i = 0; i < g_n_outputs; i++) {
             char p[512];
-            snprintf(p, sizeof(p), "%s/gammactrl_%s_0.icc", icc_dir, g_outputs[i].name);
-            remove(p);
-            snprintf(p, sizeof(p), "%s/gammactrl_%s_1.icc", icc_dir, g_outputs[i].name);
-            remove(p);
+            snprintf(p, sizeof(p), "%s/gammactrl_%s_0.icc", icc_dir, g_outputs[i].name); remove(p);
+            snprintf(p, sizeof(p), "%s/gammactrl_%s_1.icc", icc_dir, g_outputs[i].name); remove(p);
             LOG("Cleared stale ICC files for %s", g_outputs[i].name);
         }
     }
@@ -283,57 +237,109 @@ static uint8_t *build_vcgt_tag(double gamma, size_t *out_len) {
     return tag;
 }
 
-static int copy_and_patch_icc(const char *src_path, const char *dst_path, double gamma) {
+static int copy_and_patch_icc(const char *src_path, const char *dst_path, double slider_val) {
     FILE *src = fopen(src_path, "rb");
     if (!src) return -1;
     fseek(src, 0, SEEK_END);
     long file_size = ftell(src);
     fseek(src, 0, SEEK_SET);
-    uint8_t *data = malloc(file_size);
+
+    size_t padded_sz = file_size + 2048;
+    uint8_t *data = calloc(1, padded_sz);
     if (!data) { fclose(src); return -1; }
-    size_t read = fread(data, 1, file_size, src);
+
+    if ((long)fread(data, 1, file_size, src) != file_size || file_size < 132) {
+        free(data); fclose(src); return -1;
+    }
     fclose(src);
-    if (read != (size_t)file_size || file_size < 128) { free(data); return -1; }
 
     uint32_t profile_size = (data[0]<<24)|(data[1]<<16)|(data[2]<<8)|data[3];
-    if (profile_size != file_size) { free(data); return -1; }
+    if (profile_size != (uint32_t)file_size) { free(data); return -1; }
     uint32_t tag_count = (data[128]<<24)|(data[129]<<16)|(data[130]<<8)|data[131];
     if (tag_count == 0 || tag_count > 100) { free(data); return -1; }
 
-    uint8_t *tag_table = data + 128 + 4;
-    int vcgt_index = -1;
+    uint8_t *tag_table  = data + 132;
+    int      vcgt_found = 0;
     uint32_t vcgt_offset = 0, vcgt_size = 0;
+
     for (uint32_t i = 0; i < tag_count; i++) {
         uint8_t *entry = tag_table + i * 12;
         if (memcmp(entry, "vcgt", 4) == 0) {
-            vcgt_index = i;
+            vcgt_found  = 1;
             vcgt_offset = (entry[4]<<24)|(entry[5]<<16)|(entry[6]<<8)|entry[7];
             vcgt_size   = (entry[8]<<24)|(entry[9]<<16)|(entry[10]<<8)|entry[11];
             break;
         }
     }
-    if (vcgt_index == -1) { free(data); return -2; }
 
-    size_t new_len;
-    uint8_t *new_vcgt = build_vcgt_tag(gamma, &new_len);
-    if (!new_vcgt || new_len > vcgt_size) {
-        free(new_vcgt);
-        free(data);
-        return -2;
+    int patched = 0;
+
+    if (vcgt_found && vcgt_offset + vcgt_size <= (uint32_t)file_size && vcgt_size >= 18) {
+        uint32_t vcgt_type = (data[vcgt_offset+8]<<24)|(data[vcgt_offset+9]<<16)|(data[vcgt_offset+10]<<8)|data[vcgt_offset+11];
+        if (vcgt_type == 0) {
+            uint16_t nchannels = (data[vcgt_offset+12]<<8)|data[vcgt_offset+13];
+            uint16_t nentries  = (data[vcgt_offset+14]<<8)|data[vcgt_offset+15];
+            uint16_t entry_sz  = (data[vcgt_offset+16]<<8)|data[vcgt_offset+17];
+
+            if (entry_sz == 2 && vcgt_offset + 18 + nchannels * nentries * 2 <= (uint32_t)file_size) {
+                uint8_t *tbl = data + vcgt_offset + 18;
+                for (int i = 0; i < nchannels * nentries; i++) {
+                    double v = pow(((tbl[i*2]<<8) | tbl[i*2+1]) / 65535.0, 1.0 / slider_val);
+                    if (v < 0) v = 0;
+                    if (v > 1) v = 1;
+                    uint16_t nv = (uint16_t)(v * 65535.0);
+                    tbl[i*2] = nv >> 8; tbl[i*2+1] = nv & 0xff;
+                }
+                patched = 1;
+            }
+        }
     }
 
-    uint8_t *copy = malloc(file_size);
-    if (!copy) { free(new_vcgt); free(data); return -1; }
-    memcpy(copy, data, file_size);
-    memcpy(copy + vcgt_offset, new_vcgt, new_len);
-    free(new_vcgt);
-    free(data);
+    if (!patched) {
+        uint8_t *new_data = calloc(1, padded_sz);
+        if (!new_data) { free(data); return -1; }
+
+        memcpy(new_data, data, 132);
+        uint32_t new_tag_count = tag_count + 1;
+        write_be32(new_data + 128, new_tag_count);
+        memcpy(new_data + 132, data + 132, tag_count * 12);
+
+        uint32_t old_data_offset = 132 + tag_count * 12;
+        uint32_t new_data_offset = 132 + new_tag_count * 12;
+        memcpy(new_data + new_data_offset, data + old_data_offset, file_size - old_data_offset);
+
+        for (uint32_t i = 0; i < tag_count; i++) {
+            uint8_t *entry = new_data + 132 + i * 12;
+            uint32_t old_off = (entry[4]<<24)|(entry[5]<<16)|(entry[6]<<8)|entry[7];
+            write_be32(entry + 4, old_off + 12);
+        }
+
+        size_t vcgt_len;
+        uint8_t *vcgt = build_vcgt_tag(slider_val, &vcgt_len);
+        if (!vcgt) { free(new_data); free(data); return -1; }
+
+        uint32_t appended_offset = ((file_size + 12) + 3) & ~3;
+        memcpy(new_data + appended_offset, vcgt, vcgt_len);
+        free(vcgt);
+
+        uint8_t *new_entry = new_data + 132 + tag_count * 12;
+        memcpy(new_entry, "vcgt", 4);
+        write_be32(new_entry + 4, appended_offset);
+        write_be32(new_entry + 8, (uint32_t)vcgt_len);
+
+        uint32_t final_size = appended_offset + vcgt_len;
+        write_be32(new_data, final_size);
+
+        free(data);
+        data      = new_data;
+        file_size = final_size;
+    }
 
     FILE *dst = fopen(dst_path, "wb");
-    if (!dst) { free(copy); return -1; }
-    fwrite(copy, 1, file_size, dst);
+    if (!dst) { free(data); return -1; }
+    fwrite(data, 1, file_size, dst);
     fclose(dst);
-    free(copy);
+    free(data);
     return 0;
 }
 
@@ -370,9 +376,9 @@ static uint8_t *build_icc_from_scratch(double actual_gamma, size_t *out_sz) {
     if (!b) return NULL;
     *out_sz = tot;
 
-    write_be32(b,    (uint32_t)tot);
-    memset(b+4,' ',4);
-    write_be32(b+8,  0x02100000);
+    write_be32(b, (uint32_t)tot);
+    memset(b+4, ' ', 4);
+    write_be32(b+8, 0x02100000);
     memcpy(b+12,"mntr",4); memcpy(b+16,"RGB ",4); memcpy(b+20,"XYZ ",4);
     time_t t = time(NULL); struct tm *tm = gmtime(&t);
     write_be16(b+24,(uint16_t)(tm->tm_year+1900));
@@ -448,8 +454,8 @@ typedef struct {
     GtkWidget    *status_label;
     GtkWidget    *main_window;
     int           cur_output;
-    gboolean      initialized;
-    double        base_gamma;
+    double        sync_baseline;
+    double        profile_target;
     gboolean      baseline_valid;
     GFileMonitor *drm_monitor;
     guint         hotplug_debounce_id;
@@ -460,12 +466,11 @@ static void do_apply(AppWidgets *w);
 static void on_spin_changed(GtkSpinButton *spin, gpointer user_data);
 
 /* ── Main apply function ────────────────────────────────────────────────── */
-static int apply_gamma(AppWidgets *w, double actual_gamma) {
-    const char *out = g_outputs[w->cur_output].name;
+static int apply_gamma(AppWidgets *w, double total_mult) {
+    const char *out      = g_outputs[w->cur_output].name;
     const char *orig_icc = g_outputs[w->cur_output].icc;
-    const char *home = g_get_home_dir();
+    const char *home     = g_get_home_dir();
 
-    /* Alternate between two files so KWin always sees a new path */
     g_outputs[w->cur_output].icc_toggle = (g_outputs[w->cur_output].icc_toggle + 1) % 2;
     int toggle = g_outputs[w->cur_output].icc_toggle;
 
@@ -476,13 +481,15 @@ static int apply_gamma(AppWidgets *w, double actual_gamma) {
     LOG("apply_gamma: toggle=%d active=%s", toggle, active);
 
     if (orig_icc[0] != '\0' && access(orig_icc, R_OK) == 0) {
-        if (copy_and_patch_icc(orig_icc, active, actual_gamma) == 0) {
+        if (copy_and_patch_icc(orig_icc, active, total_mult) == 0) {
             remove(stale);
             apply_icc(out, active);
             return 0;
         }
     }
-    int r = write_icc_from_scratch(active, actual_gamma);
+
+    double hardware_gamma = w->profile_target * NATIVE_GAMMA * total_mult;
+    int r = write_icc_from_scratch(active, hardware_gamma);
     LOG("write_icc_from_scratch returned %d, file exists: %d", r, access(active, F_OK) == 0);
     if (r != 0) return -1;
     remove(stale);
@@ -494,21 +501,20 @@ static int apply_gamma(AppWidgets *w, double actual_gamma) {
 static void do_apply(AppWidgets *w) {
     if (!w->baseline_valid) return;
     double slider_val = gtk_range_get_value(GTK_RANGE(w->scale));
-
     save_multiplier(g_outputs[w->cur_output].name, slider_val);
 
-    double actual_gamma = pow(w->base_gamma, slider_val);
-
-    LOG("do_apply_val: slider=%.5f base=%.5f actual=%.5f toggle=%d",
-        slider_val, w->base_gamma, actual_gamma,
+    double total_mult = w->sync_baseline * slider_val;
+    LOG("do_apply_val: slider=%.5f sync=%.5f target=%.3f total_mult=%.5f toggle=%d",
+        slider_val, w->sync_baseline, w->profile_target, total_mult,
         g_outputs[w->cur_output].icc_toggle);
 
-    if (apply_gamma(w, actual_gamma) != 0) {
+    if (apply_gamma(w, total_mult) != 0) {
         gtk_label_set_text(GTK_LABEL(w->status_label), "Error applying gamma");
         return;
     }
     char msg[128];
-    snprintf(msg, sizeof(msg), "Applied — multiplier %.5f → gamma %.5f", slider_val, actual_gamma);
+    snprintf(msg, sizeof(msg), "Multiplier: %.5f  (Baseline %.5f - Original Gamma %.3f)",
+             slider_val, w->sync_baseline, w->profile_target);
     gtk_label_set_text(GTK_LABEL(w->status_label), msg);
 }
 
@@ -523,8 +529,8 @@ static void schedule_apply(AppWidgets *w) {
     debounce_id = g_timeout_add(250, debounce_cb, w);
 }
 
-static void sync_value_label(AppWidgets *w, double slider_val) {
-    char buf[16]; snprintf(buf, sizeof(buf), "%.5f", slider_val);
+static void sync_value_label(AppWidgets *w, double val) {
+    char buf[16]; snprintf(buf, sizeof(buf), "%.5f", val);
     gtk_label_set_text(GTK_LABEL(w->value_label), buf);
 }
 static gboolean on_scale_changed(GtkRange *scale, GtkScrollType scroll, double val, gpointer user_data) {
@@ -547,21 +553,84 @@ static void on_spin_changed(GtkSpinButton *spin, gpointer user_data) {
     schedule_apply(w);
 }
 
-/* Dynamic monitor switching */
-static void on_monitor_changed(GtkDropDown *dd, GParamSpec *ps, gpointer user_data) {
-    (void)ps;
-    AppWidgets *w = (AppWidgets*)user_data;
-    w->cur_output = (int)gtk_drop_down_get_selected(dd);
-    const char *out_name = g_outputs[w->cur_output].name;
+/* ── Read gamma from ICC file ────────────────────────────────────────────── */
 
-    // Load independent state for the new monitor
-    double saved_base = load_base_gamma(out_name);
-    w->base_gamma = (saved_base > 0) ? saved_base : 1.485;
+/* Returns the display target gamma encoded in an ICC file, normalized to
+ * NATIVE_GAMMA and rounded to 3 decimal places. Returns 1.0 if not found. */
+static double read_icc_gamma(const char *icc_path) {
+    if (!icc_path || !icc_path[0]) return 1.0;
+
+    FILE *f = fopen(icc_path, "rb");
+    if (!f) return 1.0;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 132) { fclose(f); return 1.0; }
+
+    uint8_t *data = malloc(sz);
+    if (!data) { fclose(f); return 1.0; }
+    if ((long)fread(data, 1, sz, f) != sz) { free(data); fclose(f); return 1.0; }
+    fclose(f);
+
+    uint32_t tag_count = (data[128]<<24)|(data[129]<<16)|(data[130]<<8)|data[131];
+    if (tag_count > 100) { free(data); return 1.0; }
+
+    uint8_t *tt = data + 132;
+    double gamma = NATIVE_GAMMA;
+    int found = 0;
+
+    /* FIRST PASS: vcgt tag (Hardware Calibration) */
+    for (uint32_t i = 0; i < tag_count && !found; i++) {
+        uint8_t *entry = tt + i * 12;
+        if (memcmp(entry, "vcgt", 4) != 0) continue;
+        uint32_t offset = (entry[4]<<24)|(entry[5]<<16)|(entry[6]<<8)|entry[7];
+        uint32_t tsize  = (entry[8]<<24)|(entry[9]<<16)|(entry[10]<<8)|entry[11];
+        if (tsize < 18 || (long)(offset + tsize) > sz || memcmp(data + offset, "vcgt", 4) != 0) continue;
+        uint32_t vcgt_type = (data[offset+8]<<24)|(data[offset+9]<<16)|(data[offset+10]<<8)|data[offset+11];
+        if (vcgt_type != 0) continue;
+        uint16_t nchannels = (data[offset+12]<<8)|data[offset+13];
+        uint16_t nentries  = (data[offset+14]<<8)|data[offset+15];
+        uint16_t entry_sz  = (data[offset+16]<<8)|data[offset+17];
+        if (nchannels < 1 || nentries < 2 || entry_sz != 2) continue;
+        if ((long)(offset + 18 + nchannels * nentries * 2) > sz) continue;
+        int mid = nentries / 2;
+        uint8_t *tbl = data + offset + 18;
+        double mid_val = ((tbl[mid*2]<<8)|tbl[mid*2+1]) / 65535.0;
+        double mid_in  = (double)mid / (nentries - 1);
+        if (mid_val > 0.0 && mid_in > 0.0 && mid_val < 1.0 && mid_in < 1.0) {
+            double g = log(mid_in) / log(mid_val);
+            if (g > 0.0001 && g < 100.0) { gamma = g; found = 1; }
+        }
+    }
+
+    /* SECOND PASS: rTRC tag (Software Color Space), only if vcgt not found */
+    for (uint32_t i = 0; i < tag_count && !found; i++) {
+        uint8_t *entry = tt + i * 12;
+        if (memcmp(entry, "rTRC", 4) != 0) continue;
+        uint32_t offset = (entry[4]<<24)|(entry[5]<<16)|(entry[6]<<8)|entry[7];
+        uint32_t tsize  = (entry[8]<<24)|(entry[9]<<16)|(entry[10]<<8)|entry[11];
+        if (tsize < 12 || (long)(offset + tsize) > sz || memcmp(data + offset, "para", 4) != 0) continue;
+        uint16_t ftype = (data[offset+8]<<8)|data[offset+9];
+        if (ftype != 0) continue;
+        int32_t raw = (int32_t)((data[offset+12]<<24)|(data[offset+13]<<16)|
+        (data[offset+14]<<8)  | data[offset+15]);
+        double g = raw / 65536.0;
+        if (g > 0.0001 && g < 100.0) { gamma = g; found = 1; }
+    }
+
+    free(data);
+    LOG("read_icc_gamma(%s) raw = %.5f (found=%d)", icc_path, gamma, found);
+    return round((gamma / NATIVE_GAMMA) * 1000.0) / 1000.0;
+}
+
+/* ── Monitor switching ──────────────────────────────────────────────────── */
+static void load_output_into_ui(AppWidgets *w, int idx) {
+    const char *out_name = g_outputs[idx].name;
+    w->sync_baseline  = load_sync_baseline(out_name);
+    w->profile_target = read_icc_gamma(g_outputs[idx].icc);
     w->baseline_valid = TRUE;
 
     double saved_mult = load_multiplier(out_name);
-
-    // Smoothly update UI without triggering a debounce storm
     g_signal_handlers_block_by_func(w->scale, on_scale_changed, w);
     g_signal_handlers_block_by_func(w->spin,  on_spin_changed,  w);
     gtk_range_set_value(GTK_RANGE(w->scale), saved_mult);
@@ -569,29 +638,19 @@ static void on_monitor_changed(GtkDropDown *dd, GParamSpec *ps, gpointer user_da
     g_signal_handlers_unblock_by_func(w->scale, on_scale_changed, w);
     g_signal_handlers_unblock_by_func(w->spin,  on_spin_changed,  w);
     sync_value_label(w, saved_mult);
+}
 
-    gtk_scale_clear_marks(GTK_SCALE(w->scale));
-
-    if (w->baseline_valid) {
-        char mark_label[48]; snprintf(mark_label, sizeof(mark_label), "1.0 (baseline %.5f)", w->base_gamma);
-        gtk_scale_add_mark(GTK_SCALE(w->scale), 1.0, GTK_POS_RIGHT, mark_label);
-        gtk_label_set_text(GTK_LABEL(w->status_label), "Adjust multiplier (1.0 = baseline).");
-        if (w->initialized) do_apply(w);
-    }
+static void on_monitor_changed(GtkDropDown *dd, GParamSpec *ps, gpointer user_data) {
+    (void)ps;
+    AppWidgets *w = (AppWidgets*)user_data;
+    w->cur_output = (int)gtk_drop_down_get_selected(dd);
+    load_output_into_ui(w, w->cur_output);
+    do_apply(w);
 }
 
 static void on_reset(GtkButton *btn, gpointer user_data) {
     (void)btn;
     AppWidgets *w = (AppWidgets*)user_data;
-    const char *out = g_outputs[w->cur_output].name;
-    const char *orig_icc = g_outputs[w->cur_output].icc;
-
-    if (orig_icc[0] != '\0' && access(orig_icc, R_OK) == 0) {
-        apply_icc(out, orig_icc);
-    } else {
-        apply_icc(out, "");
-    }
-
     g_signal_handlers_block_by_func(w->scale, on_scale_changed, w);
     g_signal_handlers_block_by_func(w->spin,  on_spin_changed,  w);
     gtk_range_set_value(GTK_RANGE(w->scale), SLIDER_DEFAULT);
@@ -599,11 +658,8 @@ static void on_reset(GtkButton *btn, gpointer user_data) {
     g_signal_handlers_unblock_by_func(w->scale, on_scale_changed, w);
     g_signal_handlers_unblock_by_func(w->spin,  on_spin_changed,  w);
     sync_value_label(w, SLIDER_DEFAULT);
-    save_multiplier(out, SLIDER_DEFAULT);
-
-    char msg[128];
-    snprintf(msg, sizeof(msg), "Reset to %s", (orig_icc[0] ? "Default Profile" : "Native Output"));
-    gtk_label_set_text(GTK_LABEL(w->status_label), msg);
+    save_multiplier(g_outputs[w->cur_output].name, SLIDER_DEFAULT);
+    do_apply(w);
 }
 
 /* ── Custom Day 1 Default Logic ─────────────────────────────────────────── */
@@ -620,16 +676,16 @@ static void apply_default_change(AppWidgets *w, GtkWidget *parent_dlg, const cha
         fclose(f);
     }
 
-    if (new_icc && new_icc[0]) {
+    if (new_icc && new_icc[0])
         strncpy(g_outputs[cur].icc, new_icc, sizeof(g_outputs[cur].icc)-1);
-    } else {
+    else
         g_outputs[cur].icc[0] = '\0';
-    }
 
     apply_icc(g_outputs[cur].name, g_outputs[cur].icc);
 
-    w->base_gamma = 1.485;
+    w->sync_baseline  = 1.0;
     w->baseline_valid = TRUE;
+    save_sync_baseline(g_outputs[cur].name, 1.0);
 
     g_signal_handlers_block_by_func(w->scale, on_scale_changed, w);
     g_signal_handlers_block_by_func(w->spin,  on_spin_changed,  w);
@@ -640,10 +696,8 @@ static void apply_default_change(AppWidgets *w, GtkWidget *parent_dlg, const cha
     sync_value_label(w, SLIDER_DEFAULT);
     save_multiplier(g_outputs[cur].name, SLIDER_DEFAULT);
 
-    gtk_label_set_text(GTK_LABEL(w->status_label), "Default ICC profile updated.");
-    gtk_scale_clear_marks(GTK_SCALE(w->scale));
-    char mark_label[48]; snprintf(mark_label, sizeof(mark_label), "1.0 (baseline %.5f)", w->base_gamma);
-    gtk_scale_add_mark(GTK_SCALE(w->scale), 1.0, GTK_POS_RIGHT, mark_label);
+    w->profile_target = read_icc_gamma(g_outputs[cur].icc);
+    do_apply(w);
 
     if (parent_dlg) gtk_window_destroy(GTK_WINDOW(parent_dlg));
 }
@@ -656,9 +710,8 @@ static void on_native_day1_clicked(GtkButton *btn, gpointer user_data) {
 
 static void on_file_dialog_response(GObject *source, GAsyncResult *result, gpointer user_data) {
     AppWidgets *w = (AppWidgets*)user_data;
-    GtkFileDialog *dialog = GTK_FILE_DIALOG(source);
     GError *error = NULL;
-    GFile *file = gtk_file_dialog_open_finish(dialog, result, &error);
+    GFile *file = gtk_file_dialog_open_finish(GTK_FILE_DIALOG(source), result, &error);
     if (file) {
         char *filename = g_file_get_path(file);
         apply_default_change(w, NULL, filename);
@@ -671,13 +724,10 @@ static void on_file_dialog_response(GObject *source, GAsyncResult *result, gpoin
 static void on_file_day1_clicked(GtkButton *btn, gpointer user_data) {
     AppWidgets *w = (AppWidgets*)user_data;
     GtkWidget *dlg = g_object_get_data(G_OBJECT(btn), "dialog");
-
     GtkFileDialog *dialog = gtk_file_dialog_new();
     gtk_file_dialog_set_title(dialog, "Select ICC Profile");
-    gtk_file_dialog_open(dialog, GTK_WINDOW(w->main_window), NULL,
-                         on_file_dialog_response, w);
+    gtk_file_dialog_open(dialog, GTK_WINDOW(w->main_window), NULL, on_file_dialog_response, w);
     g_object_unref(dialog);
-
     gtk_window_destroy(GTK_WINDOW(dlg));
 }
 
@@ -692,10 +742,8 @@ static void on_change_default_clicked(GtkButton *btn, gpointer user_data) {
     gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
 
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-    gtk_widget_set_margin_start(box, 20);
-    gtk_widget_set_margin_end(box, 20);
-    gtk_widget_set_margin_top(box, 20);
-    gtk_widget_set_margin_bottom(box, 20);
+    gtk_widget_set_margin_start(box, 20); gtk_widget_set_margin_end(box, 20);
+    gtk_widget_set_margin_top(box, 20);   gtk_widget_set_margin_bottom(box, 20);
     gtk_window_set_child(GTK_WINDOW(dlg), box);
 
     char msg[256];
@@ -709,7 +757,7 @@ static void on_change_default_clicked(GtkButton *btn, gpointer user_data) {
     g_signal_connect(btn_icc, "clicked", G_CALLBACK(on_file_day1_clicked), w);
     gtk_box_append(GTK_BOX(box), btn_icc);
 
-    GtkWidget *btn_native = gtk_button_new_with_label("Set to Native (No Profile)");
+    GtkWidget *btn_native = gtk_button_new_with_label("Set to no profile");
     g_object_set_data(G_OBJECT(btn_native), "dialog", dlg);
     g_signal_connect(btn_native, "clicked", G_CALLBACK(on_native_day1_clicked), w);
     gtk_box_append(GTK_BOX(box), btn_native);
@@ -718,46 +766,38 @@ static void on_change_default_clicked(GtkButton *btn, gpointer user_data) {
 }
 
 /* ── Reset All and Relaunch ────────────────────────────────────────────── */
-static void do_reset_all(AppWidgets *w) {
+static void on_reset_all_confirm(GtkButton *btn, gpointer user_data) {
+    AppWidgets *w = (AppWidgets*)user_data;
+    GtkWidget *dlg = g_object_get_data(G_OBJECT(btn), "dialog");
+    if (dlg) gtk_window_destroy(GTK_WINDOW(dlg));
+
     const char *home = g_get_home_dir();
     char path[1024];
 
     for (int i = 0; i < g_n_outputs; i++) {
-        const char *out = g_outputs[i].name;
+        const char *out      = g_outputs[i].name;
         const char *orig_icc = g_outputs[i].icc;
+        apply_icc(out, (orig_icc[0] && access(orig_icc, R_OK) == 0) ? orig_icc : "");
 
-        if (orig_icc[0] != '\0' && access(orig_icc, R_OK) == 0) {
-            apply_icc(out, orig_icc);
-        } else {
-            apply_icc(out, "");
-        }
-
-        snprintf(path, sizeof(path), "%s/.local/share/icc/gammactrl_%s_0.icc", home, out); remove(path);
-        snprintf(path, sizeof(path), "%s/.local/share/icc/gammactrl_%s_1.icc", home, out); remove(path);
+        snprintf(path, sizeof(path), "%s/.local/share/icc/gammactrl_%s_0.icc",      home, out); remove(path);
+        snprintf(path, sizeof(path), "%s/.local/share/icc/gammactrl_%s_1.icc",      home, out); remove(path);
         snprintf(path, sizeof(path), "%s/.local/share/icc/gammactrl_sync_%s_0.icc", home, out); remove(path);
         snprintf(path, sizeof(path), "%s/.local/share/icc/gammactrl_sync_%s_1.icc", home, out); remove(path);
-        snprintf(path, sizeof(path), "%s/.config/gammactrl/base_%s", home, out); remove(path);
-        snprintf(path, sizeof(path), "%s/.config/gammactrl/mult_%s", home, out); remove(path);
-        snprintf(path, sizeof(path), "%s/.config/gammactrl/day1_%s", home, out); remove(path);
+        snprintf(path, sizeof(path), "%s/.config/gammactrl/sync_%s",                home, out); remove(path);
+        snprintf(path, sizeof(path), "%s/.config/gammactrl/mult_%s",                home, out); remove(path);
+        snprintf(path, sizeof(path), "%s/.config/gammactrl/day1_%s",                home, out); remove(path);
     }
 
     char exe_path[1024];
     ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
     if (len != -1) {
         exe_path[len] = '\0';
-        char lock_path[512];
-        snprintf(lock_path, sizeof(lock_path), "%s/.config/gammactrl/gammactrl.lock", home);
-        remove(lock_path);
+        snprintf(path, sizeof(path), "%s/.config/gammactrl/gammactrl.lock", home);
+        remove(path);
         char *args[] = { exe_path, NULL };
         execv(exe_path, args);
     }
-}
-
-static void on_reset_all_confirm(GtkButton *btn, gpointer user_data) {
-    AppWidgets *w = (AppWidgets*)user_data;
-    GtkWidget *dlg = g_object_get_data(G_OBJECT(btn), "dialog");
-    if (dlg) gtk_window_destroy(GTK_WINDOW(dlg));
-    do_reset_all(w);
+    (void)w;
 }
 
 static void on_reset_all(GtkButton *btn, gpointer user_data) {
@@ -766,15 +806,14 @@ static void on_reset_all(GtkButton *btn, gpointer user_data) {
 
     GtkWidget *dlg = gtk_window_new();
     gtk_window_set_title(GTK_WINDOW(dlg), "Reset All Settings?");
-    gtk_window_set_default_size(GTK_WINDOW(dlg), 320, 160);
+    gtk_window_set_default_size(GTK_WINDOW(dlg), 320, -1);
+    gtk_window_set_resizable(GTK_WINDOW(dlg), FALSE);
     gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(w->main_window));
     gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
 
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-    gtk_widget_set_margin_start(box, 20);
-    gtk_widget_set_margin_end(box, 20);
-    gtk_widget_set_margin_top(box, 20);
-    gtk_widget_set_margin_bottom(box, 20);
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 16);
+    gtk_widget_set_margin_start(box, 16); gtk_widget_set_margin_end(box, 16);
+    gtk_widget_set_margin_top(box, 16);   gtk_widget_set_margin_bottom(box, 16);
     gtk_window_set_child(GTK_WINDOW(dlg), box);
 
     GtkWidget *lbl = gtk_label_new("This will erase all saved settings for every monitor and relaunch. This cannot be undone.");
@@ -817,77 +856,86 @@ typedef struct {
 } SyncWidgets;
 
 static void sync_apply_new(SyncWidgets *s) {
-    double gamma = gtk_range_get_value(GTK_RANGE(s->scale));
+    double sync_val = gtk_range_get_value(GTK_RANGE(s->scale));
     const char *out = g_outputs[s->w->cur_output].name;
     s->preview_toggle = (s->preview_toggle + 1) % 2;
-    write_icc_from_scratch(s->preview_icc[s->preview_toggle], gamma);
-    apply_icc(out, s->preview_icc[s->preview_toggle]);
+
+    if (s->orig_icc[0] != '\0' && access(s->orig_icc, R_OK) == 0)
+        copy_and_patch_icc(s->orig_icc, s->preview_icc[s->preview_toggle], sync_val);
+    else
+        write_icc_from_scratch(s->preview_icc[s->preview_toggle],
+                               s->w->profile_target * NATIVE_GAMMA * sync_val);
+
+        apply_icc(out, s->preview_icc[s->preview_toggle]);
 }
+
 static void sync_restore_orig(SyncWidgets *s) {
-    const char *out = g_outputs[s->w->cur_output].name;
-    apply_icc(out, s->orig_icc);
+    apply_icc(g_outputs[s->w->cur_output].name, s->orig_icc);
 }
+
+static void sync_set_status(SyncWidgets *s, double sync_val) {
+    char msg[64];
+    snprintf(msg, sizeof(msg), "▶ Sync Multiplier: %.5f", sync_val);
+    gtk_label_set_text(GTK_LABEL(s->status_label), msg);
+}
+
 static gboolean sync_toggle_cb(gpointer user_data) {
     SyncWidgets *s = (SyncWidgets*)user_data;
     if (!GTK_IS_WIDGET(s->dialog)) return G_SOURCE_REMOVE;
     s->toggle_phase ^= 1;
     if (s->toggle_phase == 0) {
         sync_restore_orig(s);
-        gtk_label_set_text(GTK_LABEL(s->status_label), "◀ Original State (before calibration)");
+        gtk_label_set_text(GTK_LABEL(s->status_label), "◀ Original State");
     } else {
         sync_apply_new(s);
-        double gamma = gtk_range_get_value(GTK_RANGE(s->scale));
-        char msg[64]; snprintf(msg, sizeof(msg), "▶ New gamma: %.5f", gamma);
-        gtk_label_set_text(GTK_LABEL(s->status_label), msg);
+        sync_set_status(s, gtk_range_get_value(GTK_RANGE(s->scale)));
     }
     return G_SOURCE_CONTINUE;
 }
+
 static guint sync_debounce_id = 0;
 static gboolean sync_debounce_cb(gpointer user_data) {
     sync_debounce_id = 0;
     SyncWidgets *s = (SyncWidgets*)user_data;
     if (!GTK_IS_WIDGET(s->dialog)) return G_SOURCE_REMOVE;
-    /* Apply the new gamma immediately, then start the toggle timer */
     sync_apply_new(s);
-    double gamma = gtk_range_get_value(GTK_RANGE(s->scale));
-    char msg[64]; snprintf(msg, sizeof(msg), "▶ New gamma: %.5f", gamma);
-    gtk_label_set_text(GTK_LABEL(s->status_label), msg);
+    sync_set_status(s, gtk_range_get_value(GTK_RANGE(s->scale)));
     s->toggle_phase = 1;
     if (s->toggle_timer_id) g_source_remove(s->toggle_timer_id);
     s->toggle_timer_id = g_timeout_add(1000, sync_toggle_cb, s);
     return G_SOURCE_REMOVE;
 }
-static void on_sync_scale_changed(GtkRange *scale, gpointer user_data) {
-    SyncWidgets *s = (SyncWidgets*)user_data;
-    if (s->updating) return;
-    double gamma = gtk_range_get_value(scale);
-    s->updating = TRUE;
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(s->spin), gamma);
-    s->updating = FALSE;
-    char buf[16]; snprintf(buf, sizeof(buf), "%.5f", gamma);
+
+static void sync_slider_updated(SyncWidgets *s, double val) {
+    char buf[16]; snprintf(buf, sizeof(buf), "%.5f", val);
     gtk_label_set_text(GTK_LABEL(s->value_label), buf);
-    /* Stop the toggle timer while dragging, debounce the apply */
     if (s->toggle_timer_id) { g_source_remove(s->toggle_timer_id); s->toggle_timer_id = 0; }
     if (sync_debounce_id) g_source_remove(sync_debounce_id);
     sync_debounce_id = g_timeout_add(400, sync_debounce_cb, s);
+}
+
+static void on_sync_scale_changed(GtkRange *scale, gpointer user_data) {
+    SyncWidgets *s = (SyncWidgets*)user_data;
+    if (s->updating) return;
+    double val = gtk_range_get_value(scale);
+    s->updating = TRUE;
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(s->spin), val);
+    s->updating = FALSE;
+    sync_slider_updated(s, val);
 }
 static void on_sync_spin_changed(GtkSpinButton *spin, gpointer user_data) {
     SyncWidgets *s = (SyncWidgets*)user_data;
     if (s->updating) return;
-    double gamma = gtk_spin_button_get_value(spin);
+    double val = gtk_spin_button_get_value(spin);
     s->updating = TRUE;
-    gtk_range_set_value(GTK_RANGE(s->scale), gamma);
+    gtk_range_set_value(GTK_RANGE(s->scale), val);
     s->updating = FALSE;
-    char buf[16]; snprintf(buf, sizeof(buf), "%.5f", gamma);
-    gtk_label_set_text(GTK_LABEL(s->value_label), buf);
-    if (s->toggle_timer_id) { g_source_remove(s->toggle_timer_id); s->toggle_timer_id = 0; }
-    if (sync_debounce_id) g_source_remove(sync_debounce_id);
-    sync_debounce_id = g_timeout_add(400, sync_debounce_cb, s);
+    sync_slider_updated(s, val);
 }
+
 static void sync_cleanup(SyncWidgets *s) {
-    if (s->toggle_timer_id) g_source_remove(s->toggle_timer_id);
-    s->toggle_timer_id = 0;
-    if (sync_debounce_id) { g_source_remove(sync_debounce_id); sync_debounce_id = 0; }
+    if (s->toggle_timer_id) { g_source_remove(s->toggle_timer_id); s->toggle_timer_id = 0; }
+    if (sync_debounce_id)   { g_source_remove(sync_debounce_id);   sync_debounce_id = 0; }
     if (s->preview_icc[0][0]) remove(s->preview_icc[0]);
     if (s->preview_icc[1][0]) remove(s->preview_icc[1]);
 }
@@ -895,61 +943,44 @@ static void sync_cleanup(SyncWidgets *s) {
 static void on_sync_confirm(GtkButton *btn, gpointer user_data) {
     (void)btn;
     SyncWidgets *s = (SyncWidgets*)user_data;
-    double chosen_gamma = gtk_range_get_value(GTK_RANGE(s->scale));
+    double chosen_sync = gtk_range_get_value(GTK_RANGE(s->scale));
     sync_cleanup(s);
 
     const char *out_name = g_outputs[s->w->cur_output].name;
-    save_base_gamma(out_name, chosen_gamma);
-
-    s->w->base_gamma = chosen_gamma;
+    save_sync_baseline(out_name, chosen_sync);
+    s->w->sync_baseline  = chosen_sync;
     s->w->baseline_valid = TRUE;
 
-    if (s->w->scale) {
-        char mark_label[48]; snprintf(mark_label, sizeof(mark_label), "1.0 (baseline %.5f)", chosen_gamma);
-        gtk_scale_clear_marks(GTK_SCALE(s->w->scale));
-        gtk_scale_add_mark(GTK_SCALE(s->w->scale), SLIDER_DEFAULT, GTK_POS_RIGHT, mark_label);
-        g_signal_handlers_block_by_func(s->w->scale, on_scale_changed, s->w);
-        g_signal_handlers_block_by_func(s->w->spin,  on_spin_changed,  s->w);
-        gtk_range_set_value(GTK_RANGE(s->w->scale), SLIDER_DEFAULT);
-        gtk_spin_button_set_value(GTK_SPIN_BUTTON(s->w->spin), SLIDER_DEFAULT);
-        g_signal_handlers_unblock_by_func(s->w->scale, on_scale_changed, s->w);
-        g_signal_handlers_unblock_by_func(s->w->spin,  on_spin_changed,  s->w);
-        sync_value_label(s->w, SLIDER_DEFAULT);
-        save_multiplier(out_name, SLIDER_DEFAULT);
-    }
+    g_signal_handlers_block_by_func(s->w->scale, on_scale_changed, s->w);
+    g_signal_handlers_block_by_func(s->w->spin,  on_spin_changed,  s->w);
+    gtk_range_set_value(GTK_RANGE(s->w->scale), SLIDER_DEFAULT);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(s->w->spin), SLIDER_DEFAULT);
+    g_signal_handlers_unblock_by_func(s->w->scale, on_scale_changed, s->w);
+    g_signal_handlers_unblock_by_func(s->w->spin,  on_spin_changed,  s->w);
+    sync_value_label(s->w, SLIDER_DEFAULT);
+    save_multiplier(out_name, SLIDER_DEFAULT);
 
     do_apply(s->w);
+    gtk_window_destroy(GTK_WINDOW(s->dialog));
+}
 
-    char msg[128]; snprintf(msg, sizeof(msg), "Baseline saved and applied: gamma = %.5f.", chosen_gamma);
-    gtk_label_set_text(GTK_LABEL(s->w->status_label), msg);
+static void sync_close(SyncWidgets *s) {
+    sync_cleanup(s);
+    if (s->w->baseline_valid)
+        do_apply(s->w);
+    else
+        sync_restore_orig(s);
     gtk_window_destroy(GTK_WINDOW(s->dialog));
 }
 
 static void on_sync_cancel(GtkButton *btn, gpointer user_data) {
     (void)btn;
-    SyncWidgets *s = (SyncWidgets*)user_data;
-    sync_cleanup(s);
-
-    if (s->w->baseline_valid) {
-        do_apply(s->w);
-    } else {
-        sync_restore_orig(s);
-    }
-
-    gtk_window_destroy(GTK_WINDOW(s->dialog));
+    sync_close((SyncWidgets*)user_data);
 }
 
 static gboolean on_sync_close_request(GtkWindow *win, gpointer user_data) {
     (void)win;
-    SyncWidgets *s = (SyncWidgets*)user_data;
-    sync_cleanup(s);
-
-    if (s->w->baseline_valid) {
-        do_apply(s->w);
-    } else {
-        sync_restore_orig(s);
-    }
-
+    sync_close((SyncWidgets*)user_data);
     return FALSE;
 }
 
@@ -964,8 +995,7 @@ static void show_sync_dialog(AppWidgets *w) {
     snprintf(s->preview_icc[0], sizeof(s->preview_icc[0]), "%s/.local/share/icc/gammactrl_sync_%s_0.icc", home, out_name);
     snprintf(s->preview_icc[1], sizeof(s->preview_icc[1]), "%s/.local/share/icc/gammactrl_sync_%s_1.icc", home, out_name);
     s->preview_toggle = -1;
-
-    s->toggle_phase = 0;
+    s->toggle_phase   = 0;
     sync_restore_orig(s);
 
     GtkWidget *dlg = gtk_window_new();
@@ -974,17 +1004,14 @@ static void show_sync_dialog(AppWidgets *w) {
     char title[128];
     snprintf(title, sizeof(title), "Sync Baseline - %s", out_name);
     gtk_window_set_title(GTK_WINDOW(dlg), title);
-
     gtk_window_set_default_size(GTK_WINDOW(dlg), 290, 580);
     gtk_window_set_resizable(GTK_WINDOW(dlg), FALSE);
     if (w->main_window) gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(w->main_window));
     gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
 
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
-    gtk_widget_set_margin_start(root, 20);
-    gtk_widget_set_margin_end(root, 20);
-    gtk_widget_set_margin_top(root, 20);
-    gtk_widget_set_margin_bottom(root, 20);
+    gtk_widget_set_margin_start(root, 20); gtk_widget_set_margin_end(root, 20);
+    gtk_widget_set_margin_top(root, 20);   gtk_widget_set_margin_bottom(root, 20);
     gtk_window_set_child(GTK_WINDOW(dlg), root);
 
     GtkWidget *heading = gtk_label_new("Sync Baseline");
@@ -992,13 +1019,13 @@ static void show_sync_dialog(AppWidgets *w) {
     gtk_widget_set_halign(heading, GTK_ALIGN_CENTER);
     gtk_box_append(GTK_BOX(root), heading);
 
-    const char *orig_desc = (s->orig_icc[0] == '\0') ? "no profile (native output)" : s->orig_icc;
     char inst_text[700];
     snprintf(inst_text, sizeof(inst_text),
-             "Your screen will alternate every second between your original state and the new gamma.\n\n"
+             "Sync the default gamma baseline of the program to match your screen in case it is misaligned.\n\n"
+             "Your screen will alternate every second between your default profile and the sync multiplier.\n\n"
              "Original State: %s\n\n"
-             "Drag the slider to find the gamma that looks correct. When satisfied, click Confirm.",
-             orig_desc);
+             "Drag the slider from 1.0 to correct the baseline.",
+             s->orig_icc[0] ? s->orig_icc : "no profile");
     GtkWidget *inst = gtk_label_new(inst_text);
     gtk_label_set_wrap(GTK_LABEL(inst), TRUE);
     gtk_label_set_max_width_chars(GTK_LABEL(inst), 36);
@@ -1012,7 +1039,7 @@ static void show_sync_dialog(AppWidgets *w) {
     gtk_box_append(GTK_BOX(root), row);
 
     GtkWidget *lbl_col = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    GtkWidget *lbl_br = gtk_label_new("Brighter");
+    GtkWidget *lbl_br  = gtk_label_new("Brighter");
     gtk_widget_set_valign(lbl_br, GTK_ALIGN_START);
     gtk_widget_add_css_class(lbl_br, "dim-label");
     GtkWidget *lbl_dk = gtk_label_new("Darker");
@@ -1023,28 +1050,27 @@ static void show_sync_dialog(AppWidgets *w) {
     gtk_box_append(GTK_BOX(lbl_col), lbl_dk);
     gtk_box_append(GTK_BOX(row), lbl_col);
 
-    s->scale = gtk_scale_new_with_range(GTK_ORIENTATION_VERTICAL, 0.5, 3.0, 0.00001);
-    gtk_range_set_value(GTK_RANGE(s->scale), 2.2);
+    s->scale = gtk_scale_new_with_range(GTK_ORIENTATION_VERTICAL, GAMMA_MIN, GAMMA_MAX, GAMMA_STEP);
+    gtk_range_set_value(GTK_RANGE(s->scale), 1.0);
     gtk_range_set_inverted(GTK_RANGE(s->scale), TRUE);
     gtk_scale_set_draw_value(GTK_SCALE(s->scale), FALSE);
     gtk_widget_set_size_request(s->scale, 40, 240);
     gtk_widget_set_vexpand(s->scale, TRUE);
-    gtk_scale_add_mark(GTK_SCALE(s->scale), 2.2, GTK_POS_RIGHT, "Standard");
+    gtk_scale_add_mark(GTK_SCALE(s->scale), 1.0, GTK_POS_RIGHT, "1.0 (Neutral)");
     gtk_box_append(GTK_BOX(row), s->scale);
 
-    char val_buf[16]; snprintf(val_buf, sizeof(val_buf), "%.5f", 2.2);
-    s->value_label = gtk_label_new(val_buf);
+    s->value_label = gtk_label_new("1.00000");
     gtk_widget_add_css_class(s->value_label, "title-3");
     gtk_widget_set_valign(s->value_label, GTK_ALIGN_CENTER);
     gtk_box_append(GTK_BOX(row), s->value_label);
 
-    s->spin = gtk_spin_button_new_with_range(0.5, 3.0, 0.00001);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(s->spin), 2.2);
+    s->spin = gtk_spin_button_new_with_range(GAMMA_MIN, GAMMA_MAX, GAMMA_STEP);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(s->spin), 1.0);
     gtk_spin_button_set_digits(GTK_SPIN_BUTTON(s->spin), 5);
     gtk_widget_set_halign(s->spin, GTK_ALIGN_CENTER);
     gtk_box_append(GTK_BOX(root), s->spin);
 
-    s->status_label = gtk_label_new("◀ Original State — move slider to compare");
+    s->status_label = gtk_label_new("◀ Original State");
     gtk_label_set_wrap(GTK_LABEL(s->status_label), TRUE);
     gtk_widget_add_css_class(s->status_label, "dim-label");
     gtk_box_append(GTK_BOX(root), s->status_label);
@@ -1057,14 +1083,14 @@ static void show_sync_dialog(AppWidgets *w) {
     g_signal_connect(cancel_btn, "clicked", G_CALLBACK(on_sync_cancel), s);
     gtk_box_append(GTK_BOX(btn_row), cancel_btn);
 
-    GtkWidget *confirm = gtk_button_new_with_label("Confirm Baseline");
+    GtkWidget *confirm = gtk_button_new_with_label("Confirm Sync");
     gtk_widget_add_css_class(confirm, "suggested-action");
     g_signal_connect(confirm, "clicked", G_CALLBACK(on_sync_confirm), s);
     gtk_box_append(GTK_BOX(btn_row), confirm);
 
-    g_signal_connect(s->scale, "value-changed", G_CALLBACK(on_sync_scale_changed), s);
-    g_signal_connect(s->spin,  "value-changed", G_CALLBACK(on_sync_spin_changed),  s);
-    g_signal_connect(dlg, "close-request", G_CALLBACK(on_sync_close_request), s);
+    g_signal_connect(s->scale, "value-changed",  G_CALLBACK(on_sync_scale_changed), s);
+    g_signal_connect(s->spin,  "value-changed",  G_CALLBACK(on_sync_spin_changed),  s);
+    g_signal_connect(dlg,      "close-request",  G_CALLBACK(on_sync_close_request), s);
 
     g_object_set_data_full(G_OBJECT(dlg), "sync-widgets", s, g_free);
     gtk_window_present(GTK_WINDOW(dlg));
@@ -1078,30 +1104,25 @@ static void on_resync(GtkButton *btn, gpointer user_data) {
 /* ── Hotplug detection ──────────────────────────────────────────────────── */
 
 static void rebuild_monitor_combo(AppWidgets *w) {
-    const char *prev_name = g_outputs[w->cur_output].name;
     char saved_name[256];
-    strncpy(saved_name, prev_name, sizeof(saved_name) - 1);
+    strncpy(saved_name, g_outputs[w->cur_output].name, sizeof(saved_name) - 1);
 
     detect_outputs();
     if (g_n_outputs == 0) {
         g_n_outputs = 1;
         strncpy(g_outputs[0].name, "unknown", 255);
-        g_outputs[0].icc[0] = '\0';
-        g_outputs[0].priority = 1;
+        g_outputs[0].icc[0]    = '\0';
         g_outputs[0].icc_toggle = -1;
     }
 
-    /* Rebuild the dropdown list */
     GtkStringList *slist = gtk_string_list_new(NULL);
     for (int i = 0; i < g_n_outputs; i++)
         gtk_string_list_append(slist, g_outputs[i].name);
 
-    /* Swap model without triggering on_monitor_changed */
     g_signal_handlers_block_by_func(w->monitor_combo, on_monitor_changed, w);
     gtk_drop_down_set_model(GTK_DROP_DOWN(w->monitor_combo), G_LIST_MODEL(slist));
     g_object_unref(slist);
 
-    /* Try to reselect the previously active output */
     int new_sel = 0;
     for (int i = 0; i < g_n_outputs; i++) {
         if (strcmp(g_outputs[i].name, saved_name) == 0) { new_sel = i; break; }
@@ -1122,11 +1143,8 @@ static gboolean hotplug_debounce_cb(gpointer user_data) {
     return G_SOURCE_REMOVE;
 }
 
-static void on_drm_changed(GFileMonitor     *monitor,
-                           GFile            *file,
-                           GFile            *other_file,
-                           GFileMonitorEvent event_type,
-                           gpointer          user_data) {
+static void on_drm_changed(GFileMonitor *monitor, GFile *file, GFile *other_file,
+                           GFileMonitorEvent event_type, gpointer user_data) {
     (void)monitor; (void)file; (void)other_file; (void)event_type;
     AppWidgets *w = (AppWidgets*)user_data;
     if (w->hotplug_debounce_id) g_source_remove(w->hotplug_debounce_id);
@@ -1134,22 +1152,14 @@ static void on_drm_changed(GFileMonitor     *monitor,
                            }
 
                            static void setup_hotplug_monitor(AppWidgets *w) {
-                               /* Watch /sys/class/drm with WATCH_MOVES so connector symlink
-                                * creation/deletion on hotplug triggers the callback. */
-                               GFile *drm_dir = g_file_new_for_path("/sys/class/drm");
-                               GError *err = NULL;
-                               w->drm_monitor = g_file_monitor_directory(drm_dir,
-                                                                         G_FILE_MONITOR_WATCH_MOVES,
-                                                                         NULL, &err);
+                               GFile  *drm_dir = g_file_new_for_path("/sys/class/drm");
+                               GError *err     = NULL;
+                               w->drm_monitor  = g_file_monitor_directory(drm_dir, G_FILE_MONITOR_WATCH_MOVES, NULL, &err);
                                g_object_unref(drm_dir);
                                if (err) {
-                                   g_error_free(err);
-                                   err = NULL;
-                                   /* Fallback: watch without WATCH_MOVES */
-                                   drm_dir = g_file_new_for_path("/sys/class/drm");
-                                   w->drm_monitor = g_file_monitor_directory(drm_dir,
-                                                                             G_FILE_MONITOR_NONE,
-                                                                             NULL, &err);
+                                   g_error_free(err); err = NULL;
+                                   drm_dir        = g_file_new_for_path("/sys/class/drm");
+                                   w->drm_monitor = g_file_monitor_directory(drm_dir, G_FILE_MONITOR_NONE, NULL, &err);
                                    g_object_unref(drm_dir);
                                    if (err) {
                                        LOG("Hotplug monitor unavailable: %s", err->message);
@@ -1170,22 +1180,14 @@ static void on_drm_changed(GFileMonitor     *monitor,
                                if (g_n_outputs == 0) {
                                    g_n_outputs = 1;
                                    strncpy(g_outputs[0].name, "unknown", 255);
-                                   g_outputs[0].icc[0] = '\0';
-                                   g_outputs[0].priority = 1;
+                                   g_outputs[0].icc[0]    = '\0';
                                    g_outputs[0].icc_toggle = -1;
                                }
 
-                               // Always start by selecting the first detected output
                                w->cur_output = 0;
-                               const char *initial_out = g_outputs[0].name;
-
                                const char *home = g_get_home_dir();
                                char dir[512]; snprintf(dir, sizeof(dir), "%s" ICC_DIR, home);
                                mkdir(dir, 0755);
-
-                               double saved = load_base_gamma(initial_out);
-                               w->base_gamma = (saved > 0) ? saved : 1.485;
-                               w->baseline_valid = TRUE;
 
                                GtkWidget *win = gtk_application_window_new(app);
                                w->main_window = win;
@@ -1194,10 +1196,8 @@ static void on_drm_changed(GFileMonitor     *monitor,
                                gtk_window_set_resizable(GTK_WINDOW(win), FALSE);
 
                                GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 16);
-                               gtk_widget_set_margin_start(root, 20);
-                               gtk_widget_set_margin_end(root, 20);
-                               gtk_widget_set_margin_top(root, 20);
-                               gtk_widget_set_margin_bottom(root, 20);
+                               gtk_widget_set_margin_start(root, 20); gtk_widget_set_margin_end(root, 20);
+                               gtk_widget_set_margin_top(root, 20);   gtk_widget_set_margin_bottom(root, 20);
                                gtk_window_set_child(GTK_WINDOW(win), root);
 
                                GtkWidget *title = gtk_label_new("Gamma Control");
@@ -1205,18 +1205,14 @@ static void on_drm_changed(GFileMonitor     *monitor,
                                gtk_widget_set_halign(title, GTK_ALIGN_CENTER);
                                gtk_box_append(GTK_BOX(root), title);
 
-                               /* Monitor selector: rescans outputs on every click before the popup opens */
                                GtkStringList *slist = gtk_string_list_new(NULL);
                                for (int i = 0; i < g_n_outputs; i++) gtk_string_list_append(slist, g_outputs[i].name);
                                w->monitor_combo = gtk_drop_down_new(G_LIST_MODEL(slist), NULL);
                                gtk_drop_down_set_selected(GTK_DROP_DOWN(w->monitor_combo), 0);
 
-                               /* GtkGestureClick fires pressed() before GTK opens the dropdown popup,
-                                * so rebuild_monitor_combo runs first and the user sees a fresh list. */
                                GtkGesture *click_gesture = gtk_gesture_click_new();
                                gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click_gesture), GDK_BUTTON_PRIMARY);
-                               g_signal_connect_swapped(click_gesture, "pressed",
-                                                        G_CALLBACK(rebuild_monitor_combo), w);
+                               g_signal_connect_swapped(click_gesture, "pressed", G_CALLBACK(rebuild_monitor_combo), w);
                                gtk_widget_add_controller(w->monitor_combo, GTK_EVENT_CONTROLLER(click_gesture));
 
                                gtk_box_append(GTK_BOX(root), w->monitor_combo);
@@ -1240,39 +1236,32 @@ static void on_drm_changed(GFileMonitor     *monitor,
                                gtk_box_append(GTK_BOX(lbl_col), lbl_bright);
                                gtk_box_append(GTK_BOX(row), lbl_col);
 
-                               double saved_mult = load_multiplier(initial_out);
-
                                w->scale = gtk_scale_new_with_range(GTK_ORIENTATION_VERTICAL, GAMMA_MIN, GAMMA_MAX, GAMMA_STEP);
-                               gtk_range_set_value(GTK_RANGE(w->scale), saved_mult);
                                gtk_range_set_inverted(GTK_RANGE(w->scale), TRUE);
                                gtk_scale_set_draw_value(GTK_SCALE(w->scale), FALSE);
                                gtk_widget_set_size_request(w->scale, 40, 300);
                                gtk_widget_set_vexpand(w->scale, TRUE);
-                               char mark_label[48]; snprintf(mark_label, sizeof(mark_label), "1.0 (baseline %.5f)", w->base_gamma);
-                               gtk_scale_add_mark(GTK_SCALE(w->scale), 1.0, GTK_POS_RIGHT, mark_label);
+                               gtk_scale_add_mark(GTK_SCALE(w->scale), 1.0, GTK_POS_RIGHT, "1.0 (Neutral)");
                                gtk_box_append(GTK_BOX(row), w->scale);
 
-                               char val_buf[16]; snprintf(val_buf, sizeof(val_buf), "%.5f", saved_mult);
-                               w->value_label = gtk_label_new(val_buf);
+                               w->value_label = gtk_label_new("");
                                gtk_widget_add_css_class(w->value_label, "title-3");
                                gtk_widget_set_valign(w->value_label, GTK_ALIGN_CENTER);
                                gtk_box_append(GTK_BOX(row), w->value_label);
 
                                w->spin = gtk_spin_button_new_with_range(GAMMA_MIN, GAMMA_MAX, GAMMA_STEP);
-                               gtk_spin_button_set_value(GTK_SPIN_BUTTON(w->spin), saved_mult);
                                gtk_spin_button_set_digits(GTK_SPIN_BUTTON(w->spin), 5);
                                gtk_spin_button_set_increments(GTK_SPIN_BUTTON(w->spin), 0.00001, 0.001);
                                gtk_widget_set_halign(w->spin, GTK_ALIGN_CENTER);
                                gtk_box_append(GTK_BOX(root), w->spin);
 
-                               w->status_label = gtk_label_new("Adjust multiplier (1.0 = baseline).");
+                               w->status_label = gtk_label_new("Adjust relative multiplier.");
                                gtk_widget_set_halign(w->status_label, GTK_ALIGN_CENTER);
                                gtk_label_set_wrap(GTK_LABEL(w->status_label), TRUE);
                                gtk_label_set_max_width_chars(GTK_LABEL(w->status_label), 32);
                                gtk_widget_add_css_class(w->status_label, "dim-label");
                                gtk_box_append(GTK_BOX(root), w->status_label);
 
-                               /* Row for Resync / Reset to Day 1 */
                                GtkWidget *btn_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
                                gtk_widget_set_halign(btn_row, GTK_ALIGN_CENTER);
                                gtk_box_append(GTK_BOX(root), btn_row);
@@ -1285,34 +1274,28 @@ static void on_drm_changed(GFileMonitor     *monitor,
                                g_signal_connect(sb, "clicked", G_CALLBACK(on_resync), w);
                                gtk_box_append(GTK_BOX(btn_row), sb);
 
-                               /* Row for Changing the default entirely */
                                GtkWidget *change_default_btn = gtk_button_new_with_label("Change Default ICC Profile");
                                gtk_widget_set_halign(change_default_btn, GTK_ALIGN_CENTER);
                                g_signal_connect(change_default_btn, "clicked", G_CALLBACK(on_change_default_clicked), w);
                                gtk_box_append(GTK_BOX(root), change_default_btn);
 
-                               /* Reset all and relaunch */
                                GtkWidget *reset_all_btn = gtk_button_new_with_label("Reset All Settings & Relaunch");
                                gtk_widget_add_css_class(reset_all_btn, "destructive-action");
                                gtk_widget_set_halign(reset_all_btn, GTK_ALIGN_CENTER);
                                g_signal_connect(reset_all_btn, "clicked", G_CALLBACK(on_reset_all), w);
                                gtk_box_append(GTK_BOX(root), reset_all_btn);
 
-                               g_signal_connect(w->scale, "change-value", G_CALLBACK(on_scale_changed), w);
-                               g_signal_connect(w->spin,  "value-changed", G_CALLBACK(on_spin_changed),  w);
+                               g_signal_connect(w->scale,         "change-value",    G_CALLBACK(on_scale_changed),   w);
+                               g_signal_connect(w->spin,          "value-changed",   G_CALLBACK(on_spin_changed),    w);
                                g_signal_connect(w->monitor_combo, "notify::selected", G_CALLBACK(on_monitor_changed), w);
 
+                               load_output_into_ui(w, 0);
                                gtk_window_present(GTK_WINDOW(win));
-                               w->initialized = TRUE;
-                               /* Re-apply saved gamma on startup — ICC files were cleared so
-                                * KWin reverted to native. Also primes icc_toggle so first
-                                * user interaction always gets a fresh path. */
                                do_apply(w);
                                setup_hotplug_monitor(w);
                            }
 
                            int main(int argc, char *argv[]) {
-                               /* Single-instance enforcement via lockfile */
                                const char *home_env = getenv("HOME");
                                if (home_env) {
                                    char lock_dir[512], lock_path[512];
@@ -1320,13 +1303,10 @@ static void on_drm_changed(GFileMonitor     *monitor,
                                    snprintf(lock_path, sizeof(lock_path), "%s/.config/gammactrl/gammactrl.lock", home_env);
                                    mkdir(lock_dir, 0755);
                                    int lock_fd = open(lock_path, O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
-                                   if (lock_fd >= 0) {
-                                       if (flock(lock_fd, LOCK_EX | LOCK_NB) < 0) {
-                                           fprintf(stderr, "[gammactrl] Already running.\n");
-                                           close(lock_fd);
-                                           return 1;
-                                       }
-                                       /* fd held open for process lifetime; O_CLOEXEC ensures it closes on execv */
+                                   if (lock_fd >= 0 && flock(lock_fd, LOCK_EX | LOCK_NB) < 0) {
+                                       fprintf(stderr, "[gammactrl] Already running.\n");
+                                       close(lock_fd);
+                                       return 1;
                                    }
                                }
                                AppWidgets w = {0};
