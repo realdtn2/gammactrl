@@ -6,6 +6,8 @@ Wayland does not natively support legacy X11 gamma adjustment tools like `xgamma
 
 Note: HDR is not supported yet.
 
+<img width="2879" height="1799" alt="image" src="https://github.com/user-attachments/assets/8cf11921-0a58-4833-a42a-ffb295442594" />
+
 ## Prerequisites
 
 To build and run this application, you will need the following packages installed on your system. The exact package names may vary slightly depending on your Linux distribution.
