@@ -209,6 +209,14 @@ static void apply_icc(const char *output_name, const char *icc_path) {
     LOG("apply_icc cmd: %s", cmd);
     int ret = system(cmd);
     LOG("apply_icc exit: %d", ret);
+
+    /* Set color profile source to ICC (instead of EDID/built-in) so KDE actually uses the profile */
+    if (icc_path && icc_path[0] != '\0') {
+        snprintf(cmd, sizeof(cmd), "kscreen-doctor output.%s.colorProfileSource.ICC", output_name);
+        LOG("apply_icc source cmd: %s", cmd);
+        ret = system(cmd);
+        LOG("apply_icc source exit: %d", ret);
+    }
 }
 
 /* ── ICC patching ───────────────────────────────────────────────────────── */
